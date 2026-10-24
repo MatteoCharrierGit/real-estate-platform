@@ -1,0 +1,152 @@
+# Files Lambda — `real-estate-prod-files`
+
+Tiene nel database i metadati dei file degli annunci. Riceve due tipi di evento: la **notifica S3** `ObjectCreated` a
+upload completato (registra il file) e le **richieste HTTP** da API Gateway (elenco dei file di un immobile,
+cancellazione di un file). Sta nella VPC perché usa il database.
+
+## Collegamenti
+
+| Direzione | Con chi | Come |
+| --- | --- | --- |
+| Invocata da | [S3](s3.md), bucket dei file | notifica `ObjectCreated` sul prefisso `uploads/`, invocazione asincrona |
+| Invocata da | [API Gateway](api-gateway.md) | `GET /properties/{id}/files`, `DELETE /files/{id}` |
+| Chiama | [RDS Proxy](rds-proxy.md) → [RDS for PostgreSQL](rds-postgres.md) | PostgreSQL 5432, TLS, token IAM come `files_user` |
+| Chiama | [S3](s3.md) | `DeleteObject` tramite il [gateway endpoint S3](vpc-endpoints.md) |
+| Scrive i log in | [CloudWatch](cloudwatch.md) | log group `/aws/lambda/real-estate-prod-files` |
+
+Prima di lei: la [Presigned Lambda](lambda-presigned.md) firma l'upload. Regole comuni: [lambda.md](lambda.md).
+
+## Cosa fa
+
+| Evento | Accesso | Cosa fa |
+| --- | --- | --- |
+| Notifica S3 `ObjectCreated` su `uploads/` | solo S3 del nostro bucket | Registra il file nel database: chiave, immobile (dalla chiave `uploads/<propertyId>/...`), dimensione. I dati arrivano nell'evento. Se l'immobile non esiste più (upload finito dopo la sua cancellazione) o è ritirato (upload finito dopo la cancellazione dell'account del proprietario) non registra niente e cancella l'oggetto |
+| `GET /properties/{id}/files` | pubblica | Elenco dei file dell'immobile; il browser li scarica dalla distribuzione CloudFront dei file |
+| `DELETE /files/{id}` | JWT, proprietario | Controlla che l'utente sia attivo (`requireActiveUser`, [api-gateway.md](api-gateway.md#authorizer-jwt)) e l'ownership, toglie la riga dal database e cancella l'oggetto su S3 |
+
+Il database viene aggiornato solo dagli upload riusciti, senza fidarsi di una conferma del client. Alternativa scartata:
+la SPA chiama una route di conferma a upload finito; meno affidabile, perché il client può mentire o non chiamare.
+
+## Configurazione
+
+- Nella VPC, subnet A e B, security group `sg-lambda-internal` ([vpc.md](vpc.md)).
+- Utente PostgreSQL `files_user`.
+- La notifica S3 è configurata sul bucket ([s3.md](s3.md#notifica-objectcreated-verso-la-files-lambda)), solo per
+  gli oggetti creati sotto `uploads/`:
+
+File: [`config/s3-files-notification.json`](config/s3-files-notification.json)
+
+```json
+{
+  "LambdaFunctionConfigurations": [
+    {
+      "Id": "RegisterCompletedUploads",
+      "LambdaFunctionArn": "arn:aws:lambda:eu-south-1:<ACCOUNT_ID>:function:real-estate-prod-files",
+      "Events": [
+        "s3:ObjectCreated:*"
+      ],
+      "Filter": {
+        "Key": {
+          "FilterRules": [
+            {
+              "Name": "prefix",
+              "Value": "uploads/"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
+```
+
+## IAM
+
+### Execution role
+
+Ruolo `real-estate-prod-lambda-files-role`: trust [`lambda.json`](iam/trust-relationships/lambda.json), policy gestite
+`AWSLambdaBasicExecutionRole` e `AWSLambdaVPCAccessExecutionRole`, più:
+
+File: [`iam/policies/lambda-files.json`](iam/policies/lambda-files.json)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ConnectToProxyAsFilesUser",
+      "Effect": "Allow",
+      "Action": "rds-db:connect",
+      "Resource": "arn:aws:rds-db:eu-south-1:<ACCOUNT_ID>:dbuser:<PROXY_RESOURCE_ID>/files_user"
+    },
+    {
+      "Sid": "DeleteUploadedFiles",
+      "Effect": "Allow",
+      "Action": "s3:DeleteObject",
+      "Resource": "arn:aws:s3:::real-estate-prod-files-<SUFFIX>/uploads/*"
+    }
+  ]
+}
+```
+
+- `ConnectToProxyAsFilesUser`: entrare nel proxy come `files_user` per registrare e cancellare i metadati.
+- `DeleteUploadedFiles`: `s3:DeleteObject` solo su `uploads/*`, per `DELETE /files/{id}` e per gli upload arrivati
+  dopo la cancellazione dell'immobile; la chiamata passa dal gateway endpoint S3.
+- **Niente `s3:GetObject`**: chiave e dimensione arrivano nell'evento della notifica S3.
+- **Niente `sns:Publish`**: non pubblica eventi di notifica.
+
+### Chi la può invocare
+
+Due resource policy sulla funzione:
+
+1. API Gateway, con [`lambda-allow-api-gateway.json`](iam/resource-policies/lambda-allow-api-gateway.json) e
+   `<FUNCTION_NAME>` = `real-estate-prod-files` ([api-gateway.md](api-gateway.md#iam)).
+2. La notifica S3:
+
+File: [`iam/resource-policies/lambda-files-allow-s3.json`](iam/resource-policies/lambda-files-allow-s3.json)
+
+```json
+{
+  "Version": "2012-10-17",
+  "Id": "default",
+  "Statement": [
+    {
+      "Sid": "AllowFilesBucketNotifications",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "s3.amazonaws.com"
+      },
+      "Action": "lambda:InvokeFunction",
+      "Resource": "arn:aws:lambda:eu-south-1:<ACCOUNT_ID>:function:real-estate-prod-files",
+      "Condition": {
+        "ArnLike": {
+          "AWS:SourceArn": "arn:aws:s3:::real-estate-prod-files-<SUFFIX>"
+        },
+        "StringEquals": {
+          "AWS:SourceAccount": "<ACCOUNT_ID>"
+        }
+      }
+    }
+  ]
+}
+```
+
+- Principal `s3.amazonaws.com`, azione `lambda:InvokeFunction`.
+- `AWS:SourceArn` = il bucket dei file: solo il nostro bucket.
+- `AWS:SourceAccount` = il nostro account: gli ARN dei bucket non contengono l'account, quindi questa seconda
+  condizione evita che, se il bucket venisse cancellato, un altro account che ricrea un bucket con lo stesso nome possa
+  invocare la funzione (i nomi dei bucket sono unici, ma si liberano quando un bucket viene cancellato).
+- Va creata **prima** della configurazione di notifica sul bucket, altrimenti S3 la rifiuta.
+
+## Sicurezza e rete
+
+- La Lambda sta nella VPC, ma l'invocazione da S3 non passa dalla sua rete: la fa il servizio Lambda. Non serve un
+  endpoint per riceverla.
+- Per **cancellare** un oggetto invece la chiamata parte dalla Lambda: serve il **gateway endpoint S3** (gratuito), con
+  la rotta nelle route table e l'uscita 443 verso la prefix list di S3 in `sg-lambda-internal`.
+
+## File di un immobile cancellato
+
+Non li cancella questa Lambda: lo fa la [Property Lambda](lambda-property.md#cancellazione-di-un-immobile) dentro
+`DELETE /properties/{id}`, svuotando il prefisso `uploads/<propertyId>/`. Qui resta solo il caso di un upload che
+finisce dopo la cancellazione: la registrazione fallisce perché l'immobile non c'è, e la Lambda cancella l'oggetto.
