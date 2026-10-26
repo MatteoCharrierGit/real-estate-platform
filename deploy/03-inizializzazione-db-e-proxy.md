@@ -68,7 +68,7 @@ una sola, precisa, e si chiude cancellando quel gruppo. Memoria e timeout bastan
 ## 3.5 Esegui la migrazione
 
 - [ ] Nella funzione > scheda **Test** > *Create new event* (non salvarlo: se la console non te lo permette,
-      incolla il JSON senza premere *Save*). Corpo (sostituisci i valori con le tue password; **niente simboli**):
+      incolla il JSON senza premere *Save*). Corpo (sostituisci i valori con le tue password; **niente simboli, almeno 12 caratteri**: la funzione rifiuta le più corte):
   ```json
   {
     "action": "migrate",
