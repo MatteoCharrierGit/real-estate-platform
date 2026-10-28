@@ -49,3 +49,22 @@ security group non servono più e si cancellano con il teardown.
 - **Nome della DLQ.** È stata creata come `real-estate-prod-notification-dlq` invece di `...-notifications-dlq`.
   Rinominarla vorrebbe dire ricrearla, quindi resta così: nella fase 09 (allarme) e in `ops-dlq-redrive.json` va usato
   il nome reale.
+
+## 4. Aggiunte per rendere la demo usabile
+
+Non fanno parte dell'architettura documentata: servono solo al deploy di prova.
+
+- **Gruppo assegnato alla registrazione.** Il README lo segnala come lacuna: nessuno mette gli utenti nei gruppi. Nel
+  deploy di prova lo fa un trigger Cognito *Post confirmation*, `real-estate-prod-cognito-post-confirmation`
+  (codice in [`extra/cognito-post-confirmation/index.mjs`](extra/cognito-post-confirmation/index.mjs), Node.js 22, fuori
+  dalla VPC). Chi conferma la registrazione finisce in `buyer`; gli indirizzi nella variabile `AGENT_EMAILS` finiscono in
+  `agent`. Il ruolo `real-estate-prod-lambda-cognito-post-confirmation-role` ha solo `cognito-idp:AdminAddUserToGroup`
+  sul pool, e la funzione ammette come chiamante solo `cognito-idp.amazonaws.com` da quel pool. Se l'assegnazione
+  fallisce la registrazione va avanti lo stesso, e il gruppo si mette a mano. Come per i gruppi messi a mano, il gruppo
+  compare nel token al login successivo.
+  In console si collega da Cognito > pool > *Extensions* > *Add Lambda trigger* > *Sign-up* > *Post confirmation*. Da CLI
+  `update-user-pool` riporta ai valori predefiniti ogni impostazione che non gli si passa: va rimandata tutta la
+  configurazione letta con `describe-user-pool`.
+- **Annunci di prova.** 12 annunci (Torino, Pinerolese, Val Chisone) intestati all'agente demo, creati con la Property
+  Lambda vera. Le 24 foto sono illustrazioni generate, caricate in `uploads/<id>/` e registrate dalla Files Lambda
+  tramite la notifica S3, come un upload dal sito.
